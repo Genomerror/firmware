@@ -1,4 +1,5 @@
 #include "DeviceTelemetry.h"
+#include "Channels.h"
 #include "../mesh/generated/meshtastic/telemetry.pb.h"
 #include "Default.h"
 #include "MeshService.h"
@@ -14,14 +15,20 @@
 #include <OLEDDisplay.h>
 #include <OLEDDisplayUi.h>
 #include <meshUtils.h>
+#include <cstring>
 
 #define MAGIC_USB_BATTERY_LEVEL 101
 static constexpr uint16_t TX_HISTORY_KEY_DEVICE_TELEMETRY = 0x8001;
+
+static constexpr uint8_t CHARGE_COMPLETE_PERCENT = 100;
+static constexpr uint32_t CHARGE_COMPLETE_STABLE_MS = 5 * SECONDS_IN_MINUTE * 1000;
+static constexpr const char *CHARGE_COMPLETE_MESSAGE = "Аккумулятор полностью заряжен";
 
 int32_t DeviceTelemetryModule::runOnce()
 {
 
     refreshUptime();
+    updateChargeCompleteNotification();
     uint32_t lastTelemetry = transmitHistory ? transmitHistory->getLastSentToMeshMillis(TX_HISTORY_KEY_DEVICE_TELEMETRY) : 0;
     bool isImpoliteRole = isSensorOrRouterRole();
     if (((lastTelemetry == 0) ||
@@ -44,6 +51,79 @@ int32_t DeviceTelemetryModule::runOnce()
         }
     }
     return sendToPhoneIntervalMs;
+}
+
+
+void DeviceTelemetryModule::updateChargeCompleteNotification()
+{
+    if (!powerStatus) {
+        return;
+    }
+
+    const bool usbConnected = powerStatus->getHasUSB();
+    const bool batteryPresent = powerStatus->getHasBattery();
+    const uint8_t batteryPercent = powerStatus->getBatteryChargePercent();
+
+    // Re-arm only after USB is physically disconnected.
+    if (!usbConnected) {
+        if (chargeCompleteNotified || chargeFullSinceMs != 0) {
+            LOG_INFO("[ChargeNotify] USB disconnected, notification re-armed");
+        }
+        chargeCompleteNotified = false;
+        chargeFullSinceMs = 0;
+        return;
+    }
+
+    if (!batteryPresent || chargeCompleteNotified) {
+        chargeFullSinceMs = 0;
+        return;
+    }
+
+    if (batteryPercent < CHARGE_COMPLETE_PERCENT) {
+        chargeFullSinceMs = 0;
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (chargeFullSinceMs == 0) {
+        chargeFullSinceMs = now;
+        LOG_INFO("[ChargeNotify] Battery reached %u%%, waiting %u seconds for stable full charge",
+                 batteryPercent, CHARGE_COMPLETE_STABLE_MS / 1000);
+        return;
+    }
+
+    if ((uint32_t)(now - chargeFullSinceMs) < CHARGE_COMPLETE_STABLE_MS) {
+        return;
+    }
+
+    sendChargeCompleteNotification();
+}
+
+void DeviceTelemetryModule::sendChargeCompleteNotification()
+{
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p) {
+        LOG_WARN("[ChargeNotify] Could not allocate packet");
+        return;
+    }
+
+    p->to = NODENUM_BROADCAST;
+    p->channel = channels.getPrimaryIndex();
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->want_ack = false;
+    p->decoded.want_response = false;
+
+    size_t len = strlen(CHARGE_COMPLETE_MESSAGE);
+    if (len > sizeof(p->decoded.payload.bytes)) {
+        len = sizeof(p->decoded.payload.bytes);
+    }
+    p->decoded.payload.size = len;
+    memcpy(p->decoded.payload.bytes, CHARGE_COMPLETE_MESSAGE, len);
+
+    LOG_INFO("[ChargeNotify] Full charge confirmed, sending notification to Primary channel");
+    service->sendToMesh(p, RX_SRC_LOCAL, true);
+
+    chargeCompleteNotified = true;
 }
 
 bool DeviceTelemetryModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_Telemetry *t)
