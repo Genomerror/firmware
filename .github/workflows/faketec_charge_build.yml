@@ -1,0 +1,17 @@
+name: FakeTec Charge Notify Build
+
+on:
+  push:
+    branches:
+      - faketec-charge-notify-2.7.26
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  build:
+    uses: ./.github/workflows/build_firmware.yml
+    with:
+      version: 2.7.26-faketec-charge
+      pio_env: nrf52_promicro_diy_tcxo
+      platform: nrf52840
