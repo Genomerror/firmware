@@ -3,6 +3,11 @@
 #include "BaseTelemetryModule.h"
 #include "NodeDB.h"
 #include "ProtobufModule.h"
+#include "Channels.h"
+#include "MeshService.h"
+#include "PowerStatus.h"
+#include "concurrency/Periodic.h"
+#include <cstring>
 #include <OLEDDisplay.h>
 #include <OLEDDisplayUi.h>
 
@@ -16,7 +21,8 @@ class DeviceTelemetryModule : private concurrency::OSThread,
   public:
     DeviceTelemetryModule()
         : concurrency::OSThread("DeviceTelemetry"),
-          ProtobufModule("DeviceTelemetry", meshtastic_PortNum_TELEMETRY_APP, &meshtastic_Telemetry_msg)
+          ProtobufModule("DeviceTelemetry", meshtastic_PortNum_TELEMETRY_APP, &meshtastic_Telemetry_msg),
+          chargeNotifyPeriodic("ChargeNotify", [this]() { return this->runChargeNotify(); })
     {
         uptimeWrapCount = 0;
         uptimeLastMs = millis();
@@ -48,11 +54,84 @@ class DeviceTelemetryModule : private concurrency::OSThread,
     meshtastic_Telemetry getLocalStatsTelemetry();
 
     void sendLocalStatsToPhone();
-    void updateChargeCompleteNotification();
-    void sendChargeCompleteNotification();
 
+    static constexpr uint8_t CHARGE_COMPLETE_PERCENT = 100;
+    static constexpr uint32_t CHARGE_COMPLETE_STABLE_MS = 5 * SECONDS_IN_MINUTE * 1000;
+    static constexpr uint32_t CHARGE_NOTIFY_CHECK_MS = 30 * 1000;
+
+    concurrency::Periodic chargeNotifyPeriodic;
     bool chargeCompleteNotified = false;
     uint32_t chargeFullSinceMs = 0;
+
+    int32_t runChargeNotify()
+    {
+        if (!powerStatus) {
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        const bool usbConnected = powerStatus->getHasUSB();
+        const bool batteryPresent = powerStatus->getHasBattery();
+        const uint8_t batteryPercent = powerStatus->getBatteryChargePercent();
+
+        // A new charging cycle is armed only after USB has been removed.
+        if (!usbConnected) {
+            chargeCompleteNotified = false;
+            chargeFullSinceMs = 0;
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        if (!batteryPresent || chargeCompleteNotified) {
+            chargeFullSinceMs = 0;
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        if (batteryPercent < CHARGE_COMPLETE_PERCENT) {
+            chargeFullSinceMs = 0;
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        const uint32_t now = millis();
+        if (chargeFullSinceMs == 0) {
+            chargeFullSinceMs = now;
+            LOG_INFO("[ChargeNotify] Battery reached %u%%, confirming for 5 minutes", batteryPercent);
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        if ((uint32_t)(now - chargeFullSinceMs) < CHARGE_COMPLETE_STABLE_MS) {
+            return CHARGE_NOTIFY_CHECK_MS;
+        }
+
+        sendChargeCompleteNotification();
+        return CHARGE_NOTIFY_CHECK_MS;
+    }
+
+    void sendChargeCompleteNotification()
+    {
+        meshtastic_MeshPacket *p = allocDataPacket();
+        if (!p) {
+            LOG_WARN("[ChargeNotify] Packet allocation failed");
+            return;
+        }
+
+        static const char message[] = "Аккумулятор полностью заряжен";
+
+        p->to = NODENUM_BROADCAST;
+        p->channel = channels.getPrimaryIndex();
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        p->want_ack = false;
+        p->decoded.want_response = false;
+
+        size_t len = strlen(message);
+        if (len > sizeof(p->decoded.payload.bytes)) {
+            len = sizeof(p->decoded.payload.bytes);
+        }
+        p->decoded.payload.size = len;
+        memcpy(p->decoded.payload.bytes, message, len);
+
+        LOG_INFO("[ChargeNotify] Sending full-charge notification to Primary");
+        service->sendToMesh(p, RX_SRC_LOCAL, true);
+        chargeCompleteNotified = true;
+    }
     uint32_t sendToPhoneIntervalMs = SECONDS_IN_MINUTE * 1000;           // Send to phone every minute
     uint32_t sendStatsToPhoneIntervalMs = 15 * SECONDS_IN_MINUTE * 1000; // Send stats to phone every 15 minutes
     uint32_t lastSentStatsToPhone = 0;
